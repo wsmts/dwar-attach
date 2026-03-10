@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
-"""
-Add image support to DataWarrior .dwar files.
-
-Usage:
-    python add-images.py <dwar-file> <id-column> <image-column> [image-dir]
-
-Arguments:
-    dwar-file     Path to the .dwar file
-    id-column     Column name whose values map to image filenames (e.g., Name)
-    image-column  Column name to attach images to (can be same as id-column)
-    image-dir     Directory containing images (default: 'images' subfolder next to .dwar file)
-
-Image files are matched by searching for <id-value>.<ext> where ext is png, jpg, or jpeg
-(case-insensitive). The first match found is used.
-"""
-
 import sys
 import os
 import shutil
 import re
 from collections import Counter
+from pathlib import Path
+from typing import Optional
+
+import typer
+
+app = typer.Typer(help="Add image support to DataWarrior .dwar files.")
 
 SUPPORTED_EXTENSIONS = ['.png', '.jpg', '.jpeg']
 
@@ -232,22 +222,21 @@ def add_images(dwar_file, id_column, image_column, image_dir=None):
     print(f"  rows updated: {rows_updated}/{len(new_data_lines)-1}")
 
 
-def main():
-    if len(sys.argv) < 4:
-        print(__doc__)
-        sys.exit(1)
+@app.command()
+def main(
+    dwar_file: Path = typer.Argument(..., help="Path to the .dwar file", exists=True, file_okay=True, dir_okay=False),
+    id_column: str = typer.Argument(..., help="Column whose values map to image filenames (e.g. Name)"),
+    image_column: str = typer.Argument(..., help="Column to attach images to (can be same as id-column)"),
+    image_dir: Optional[Path] = typer.Argument(None, help="Directory containing images (default: 'images/' next to .dwar file)"),
+):
+    """
+    Attach images to a DataWarrior .dwar file.
 
-    dwar_file = sys.argv[1]
-    id_column = sys.argv[2]
-    image_column = sys.argv[3]
-    image_dir = sys.argv[4] if len(sys.argv) > 4 else None
-
-    if not os.path.isfile(dwar_file):
-        print(f"Error: file not found: {dwar_file}", file=sys.stderr)
-        sys.exit(1)
-
-    add_images(dwar_file, id_column, image_column, image_dir)
+    Images are matched by searching for <id-value>.png/.jpg/.jpeg (case-insensitive)
+    in the image directory. The original file is backed up with a .bak extension.
+    """
+    add_images(str(dwar_file), id_column, image_column, str(image_dir) if image_dir else None)
 
 
 if __name__ == '__main__':
-    main()
+    app()
