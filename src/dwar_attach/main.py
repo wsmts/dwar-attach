@@ -52,12 +52,12 @@ def _column_block(column_props: str, image_column: str) -> str | None:
     return m.group() if m else None
 
 
-def _slot_props(slot: int, source: str, mime_type: str, image_column: str) -> str:
+def _slot_props(slot: int, source: str, mime_type: str, name: str) -> str:
     """Return the three detailSource/Type/Name property lines for a slot."""
     return (
         f'<columnProperty="detailSource{slot}\t{source}">\n'
         f'<columnProperty="detailType{slot}\t{mime_type}">\n'
-        f'<columnProperty="detailName{slot}\t{image_column}">\n'
+        f'<columnProperty="detailName{slot}\t{name}">\n'
     )
 
 
@@ -145,19 +145,20 @@ def detect_line_ending(content):
     return '\r\n' if '\r\n' in content else '\n'
 
 
-def build_column_props_block(image_column, source, mime_type, slot: int = 0):
+def build_column_props_block(image_column, source, mime_type, slot: int = 0, name: str = ''):
     lines = [
         '<column properties>',
         f'<columnName="{image_column}">',
         f'<columnProperty="detailCount\t{slot + 1}">',
     ]
-    lines.append(_slot_props(slot, source, mime_type, image_column).rstrip('\n'))
+    lines.append(_slot_props(slot, source, mime_type, name or image_column).rstrip('\n'))
     lines.append('</column properties>')
     return '\n'.join(lines)
 
 
-def update_column_props(existing, image_column, source, mime_type, slot: int = 0):
+def update_column_props(existing, image_column, source, mime_type, slot: int = 0, name: str = ''):
     """Update or insert column properties for image_column in an existing block."""
+    slot_name = name or image_column
     if f'<columnName="{image_column}">' in existing:
         # Increment existing detailCount by 1
         updated = re.sub(
@@ -169,7 +170,7 @@ def update_column_props(existing, image_column, source, mime_type, slot: int = 0
         col_block_pattern = rf'(<columnName="{re.escape(image_column)}">.*?)(?=<columnName=|</column properties>)'
         return re.sub(
             col_block_pattern,
-            lambda m: m.group(1) + _slot_props(slot, source, mime_type, image_column),
+            lambda m: m.group(1) + _slot_props(slot, source, mime_type, slot_name),
             updated,
             flags=re.DOTALL,
         )
@@ -177,7 +178,7 @@ def update_column_props(existing, image_column, source, mime_type, slot: int = 0
         new_props = (
             f'<columnName="{image_column}">\n'
             f'<columnProperty="detailCount\t{slot + 1}">\n'
-            + _slot_props(slot, source, mime_type, image_column)
+            + _slot_props(slot, source, mime_type, slot_name)
         )
         return existing.replace('</column properties>', new_props + '</column properties>')
 
@@ -194,7 +195,7 @@ def compute_rel_path(dwar_path: Path, image_dir: Path):
     return rel.as_posix() + '/'
 
 
-def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Path] = None, embed: bool = False):
+def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Path] = None, embed: bool = False, name: Optional[str] = None):
     if image_dir is None:
         image_dir = dwar_file.resolve().parent / 'images'
 
@@ -283,11 +284,12 @@ def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Pat
 
     new_data = linesep + linesep.join(new_data_lines) + linesep
 
+    slot_name = name if name else image_column
     source = 'embedded' if embed else f'relPath:{rel_path}'
     if sections['column_props'] is None:
-        new_col_props = build_column_props_block(image_column, source, mime_type, slot=slot)
+        new_col_props = build_column_props_block(image_column, source, mime_type, slot=slot, name=slot_name)
     else:
-        new_col_props = update_column_props(sections['column_props'], image_column, source, mime_type, slot=slot)
+        new_col_props = update_column_props(sections['column_props'], image_column, source, mime_type, slot=slot, name=slot_name)
 
     parts = [sections['fileinfo'], linesep, new_col_props, new_data]
     if sections['hitlist']:
@@ -319,6 +321,7 @@ def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Pat
     print(f"  image-dir:    {image_dir.resolve()}")
     print(f"  source:       {'embedded' if embed else repr(rel_path)}")
     print(f"  slot:         {slot}")
+    print(f"  name:         {slot_name}")
     print(f"  rows updated: {rows_updated}/{len(new_data_lines)-1}")
 
 
@@ -329,6 +332,7 @@ def main(
     image_column: str = typer.Argument(..., help="Column to attach images to (can be same as id-column)"),
     image_dir: Optional[Path] = typer.Argument(None, help="Directory containing images (default: 'images/' next to .dwar file)"),
     embed: bool = typer.Option(False, '--embed', help="Embed images into the .dwar file instead of referencing them by path."),
+    name: Optional[str] = typer.Option(None, '--name', help="Label for the image slot in DataWarrior (default: image-column name)."),
 ):
     """
     Attach images to a DataWarrior .dwar file.
@@ -336,7 +340,7 @@ def main(
     Images are matched by searching for <id-value>.png/.jpg/.jpeg (case-insensitive)
     in the image directory. The original file is backed up with a .bak extension.
     """
-    add_images(dwar_file, id_column, image_column, image_dir, embed=embed)
+    add_images(dwar_file, id_column, image_column, image_dir, embed=embed, name=name)
 
 
 if __name__ == '__main__':
