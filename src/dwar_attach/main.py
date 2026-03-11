@@ -159,21 +159,22 @@ def build_column_props_block(image_column, source, mime_type, slot: int = 0, nam
 def update_column_props(existing, image_column, source, mime_type, slot: int = 0, name: str = ''):
     """Update or insert column properties for image_column in an existing block."""
     slot_name = name or image_column
+    col_block_pattern = rf'(<columnName="{re.escape(image_column)}">.*?)(?=<columnName=|</column properties>)'
     if f'<columnName="{image_column}">' in existing:
-        # Increment existing detailCount by 1
-        updated = re.sub(
-            rf'(<columnProperty="detailCount\t)(\d+)(">)',
-            lambda m: f'{m.group(1)}{int(m.group(2)) + 1}{m.group(3)}',
-            existing,
-        )
-        # Append new slot properties at the end of the column's block
-        col_block_pattern = rf'(<columnName="{re.escape(image_column)}">.*?)(?=<columnName=|</column properties>)'
-        return re.sub(
-            col_block_pattern,
-            lambda m: m.group(1) + _slot_props(slot, source, mime_type, slot_name),
-            updated,
-            flags=re.DOTALL,
-        )
+        def update_block(m):
+            block = m.group(1)
+            if 'detailCount\t' in block:
+                # Increment existing detailCount
+                block = re.sub(
+                    r'(<columnProperty="detailCount\t)(\d+)(">)',
+                    lambda m2: f'{m2.group(1)}{int(m2.group(2)) + 1}{m2.group(3)}',
+                    block,
+                )
+            else:
+                # Column exists but has no detailCount yet — add it
+                block += f'<columnProperty="detailCount\t{slot + 1}">\n'
+            return block + _slot_props(slot, source, mime_type, slot_name)
+        return re.sub(col_block_pattern, update_block, existing, flags=re.DOTALL)
     else:
         new_props = (
             f'<columnName="{image_column}">\n'
