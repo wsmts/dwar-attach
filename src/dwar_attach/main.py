@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import sys
-import os
 import shutil
 import re
 from collections import Counter
@@ -20,15 +19,15 @@ MIME_TYPES = {
 }
 
 
-def find_image(image_dir, id_val):
+def find_image(image_dir: Path, id_val):
     """Return (filename, mime_type) for the first matching image file, or (None, None)."""
     for ext in SUPPORTED_EXTENSIONS:
         filename = id_val + ext
-        if os.path.isfile(os.path.join(image_dir, filename)):
+        if (image_dir / filename).is_file():
             return filename, MIME_TYPES[ext]
         # Case-insensitive fallback
         filename_upper = id_val + ext.upper()
-        if os.path.isfile(os.path.join(image_dir, filename_upper)):
+        if (image_dir / filename_upper).is_file():
             return filename_upper, MIME_TYPES[ext]
     return None, None
 
@@ -108,21 +107,21 @@ def update_column_props(existing, image_column, rel_path, mime_type):
         return existing.replace('</column properties>', new_props + '</column properties>')
 
 
-def compute_rel_path(dwar_path, image_dir):
+def compute_rel_path(dwar_path: Path, image_dir: Path):
     """Relative path from the .dwar file's directory to image_dir, with trailing slash.
     Returns empty string if they are the same directory."""
-    dwar_dir = os.path.dirname(os.path.abspath(dwar_path))
-    rel = os.path.relpath(os.path.abspath(image_dir), dwar_dir)
-    if rel == '.':
+    dwar_dir = dwar_path.resolve().parent
+    rel = image_dir.resolve().relative_to(dwar_dir, walk_up=True)
+    if str(rel) == '.':
         return ''
-    return rel.replace('\\', '/').rstrip('/') + '/'
+    return str(rel).replace('\\', '/').rstrip('/') + '/'
 
 
-def add_images(dwar_file, id_column, image_column, image_dir=None):
+def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Path] = None):
     if image_dir is None:
-        image_dir = os.path.join(os.path.dirname(os.path.abspath(dwar_file)), 'images')
+        image_dir = dwar_file.resolve().parent / 'images'
 
-    if not os.path.isdir(image_dir):
+    if not image_dir.is_dir():
         print(f"Error: image directory not found: {image_dir}", file=sys.stderr)
         sys.exit(1)
 
@@ -171,7 +170,7 @@ def add_images(dwar_file, id_column, image_column, image_dir=None):
             cols[img_idx] = display + f'|#|0:{filename}'
             mime_counts[mime_type] += 1
         else:
-            missing.append(os.path.join(image_dir, id_val + '.<ext>'))
+            missing.append(str(image_dir / (id_val + '.<ext>')))
 
         new_data_lines.append('\t'.join(cols))
 
@@ -206,7 +205,7 @@ def add_images(dwar_file, id_column, image_column, image_dir=None):
 
     new_content = ''.join(parts)
 
-    backup = dwar_file + '.bak'
+    backup = dwar_file.with_name(dwar_file.name + '.bak')
     shutil.copy2(dwar_file, backup)
     print(f"Backup: {backup}")
 
@@ -217,7 +216,7 @@ def add_images(dwar_file, id_column, image_column, image_dir=None):
     print(f"Updated: {dwar_file}")
     print(f"  id-column:    {id_column} (index {id_idx})")
     print(f"  image-column: {image_column} (index {img_idx})")
-    print(f"  image-dir:    {os.path.abspath(image_dir)}")
+    print(f"  image-dir:    {image_dir.resolve()}")
     print(f"  relPath:      '{rel_path}'")
     print(f"  rows updated: {rows_updated}/{len(new_data_lines)-1}")
 
@@ -235,7 +234,7 @@ def main(
     Images are matched by searching for <id-value>.png/.jpg/.jpeg (case-insensitive)
     in the image directory. The original file is backed up with a .bak extension.
     """
-    add_images(str(dwar_file), id_column, image_column, str(image_dir) if image_dir else None)
+    add_images(dwar_file, id_column, image_column, image_dir)
 
 
 if __name__ == '__main__':

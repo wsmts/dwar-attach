@@ -2,7 +2,7 @@
 name = "dwar-attach"
 version = "0.1.0"
 description = "Add image support to DataWarrior .dwar files"
-requires-python = ">=3.8"
+requires-python = ">=3.12"
 dependencies = [
     "typer>=0.9",
 ]
