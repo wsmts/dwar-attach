@@ -32,8 +32,30 @@ def find_image(image_dir: Path, id_val):
     return None, None
 
 
+def encode_dw(data: bytes) -> str:
+    """Encode binary data to DataWarrior's 6-bit format with 4-byte length prefix."""
+    payload = len(data).to_bytes(4, 'big') + data
+    pad = (-len(payload) * 8) % 6
+    bits = int.from_bytes(payload, 'big') << pad
+    n = (len(payload) * 8 + pad) // 6
+    chars = [chr(((bits >> (6 * (n - 1 - i))) & 0x3F) + 64) for i in range(n)]
+    s = ''.join(chars)
+    return '\n'.join(s[i:i+80] for i in range(0, len(s), 80))
+
+
+def build_detail_section(details: list, linesep: str) -> str:
+    """Build the <detail data> block from a list of raw image bytes."""
+    lines = ['<detail data>']
+    for i, data in enumerate(details, start=1):
+        lines.append(f'<detailID="{i}">')
+        lines.append(encode_dw(data))
+        lines.append(f'</detailID>')
+    lines.append('</detail data>')
+    return linesep.join(lines)
+
+
 def parse_dwar(content):
-    """Parse a .dwar file into sections (fileinfo, column_props, data, hitlist, properties)."""
+    """Parse a .dwar file into sections (fileinfo, column_props, data, hitlist, detail_data, properties)."""
     sections = {}
 
     m = re.search(r'(<datawarrior-fileinfo>.*?</datawarrior-fileinfo>)', content, re.DOTALL)
@@ -49,21 +71,27 @@ def parse_dwar(content):
         after_colprops = after_fileinfo
 
     m_hit = re.search(r'(<hitlist data>.*?</hitlist data>)', after_colprops, re.DOTALL)
+    m_detail = re.search(r'(<detail data>.*?</detail data>)', after_colprops, re.DOTALL)
     m_prop = re.search(r'(<datawarrior properties>.*?</datawarrior properties>)', after_colprops, re.DOTALL)
 
     first_marker_pos = len(after_colprops)
     if m_hit:
         first_marker_pos = min(first_marker_pos, m_hit.start())
+    if m_detail:
+        first_marker_pos = min(first_marker_pos, m_detail.start())
     if m_prop:
         first_marker_pos = min(first_marker_pos, m_prop.start())
 
     sections['data'] = after_colprops[:first_marker_pos]
     sections['hitlist'] = m_hit.group(1) if m_hit else None
+    sections['detail_data'] = m_detail.group(1) if m_detail else None
     sections['properties'] = m_prop.group(1) if m_prop else None
 
     last_end = 0
     if m_prop:
         last_end = content.index(m_prop.group(1)) + len(m_prop.group(1))
+    elif m_detail:
+        last_end = content.index(m_detail.group(1)) + len(m_detail.group(1))
     elif m_hit:
         last_end = content.index(m_hit.group(1)) + len(m_hit.group(1))
     sections['trailing'] = content[last_end:] if last_end else ''
@@ -75,12 +103,12 @@ def detect_line_ending(content):
     return '\r\n' if '\r\n' in content else '\n'
 
 
-def build_column_props_block(image_column, rel_path, mime_type):
+def build_column_props_block(image_column, source, mime_type):
     lines = [
         '<column properties>',
         f'<columnName="{image_column}">',
         '<columnProperty="detailCount\t1">',
-        f'<columnProperty="detailSource0\trelPath:{rel_path}">',
+        f'<columnProperty="detailSource0\t{source}">',
         f'<columnProperty="detailType0\t{mime_type}">',
         f'<columnProperty="detailName0\t{image_column}">',
         '</column properties>',
@@ -88,12 +116,12 @@ def build_column_props_block(image_column, rel_path, mime_type):
     return '\n'.join(lines)
 
 
-def update_column_props(existing, image_column, rel_path, mime_type):
+def update_column_props(existing, image_column, source, mime_type):
     """Update or insert column properties for image_column in an existing block."""
     new_props = (
         f'<columnName="{image_column}">\n'
         f'<columnProperty="detailCount\t1">\n'
-        f'<columnProperty="detailSource0\trelPath:{rel_path}">\n'
+        f'<columnProperty="detailSource0\t{source}">\n'
         f'<columnProperty="detailType0\t{mime_type}">\n'
         f'<columnProperty="detailName0\t{image_column}">\n'
     )
@@ -108,16 +136,18 @@ def update_column_props(existing, image_column, rel_path, mime_type):
 
 
 def compute_rel_path(dwar_path: Path, image_dir: Path):
-    """Relative path from the .dwar file's directory to image_dir, with trailing slash.
-    Returns empty string if they are the same directory."""
+    """Return the relPath value for DataWarrior's detailSource0 column property.
+    This is the path from the .dwar file's directory to image_dir, with forward
+    slashes and a trailing slash (e.g. 'images/'). Returns empty string if they
+    are the same directory."""
     dwar_dir = dwar_path.resolve().parent
     rel = image_dir.resolve().relative_to(dwar_dir, walk_up=True)
     if str(rel) == '.':
         return ''
-    return str(rel).replace('\\', '/').rstrip('/') + '/'
+    return rel.as_posix() + '/'
 
 
-def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Path] = None):
+def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Path] = None, embed: bool = False):
     if image_dir is None:
         image_dir = dwar_file.resolve().parent / 'images'
 
@@ -155,6 +185,7 @@ def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Pat
     missing = []
     mime_counts = Counter()
     new_data_lines = [data_lines[0]]
+    embedded_images = []  # list of (row_index, bytes) for embed mode
 
     for line in data_lines[1:]:
         cols = line.split('\t')
@@ -165,9 +196,14 @@ def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Pat
         filename, mime_type = find_image(image_dir, id_val)
 
         if filename:
-            # Strip any existing |#| detail from the cell value, keep the display text
             display = cols[img_idx].split('|#|')[0] if '|#|' in cols[img_idx] else cols[img_idx]
-            cols[img_idx] = display + f'|#|0:{filename}'
+            if embed:
+                detail_id = len(embedded_images) + 1
+                image_bytes = (image_dir / filename).read_bytes()
+                embedded_images.append(image_bytes)
+                cols[img_idx] = display + f'|#|0:{detail_id}'
+            else:
+                cols[img_idx] = display + f'|#|0:{filename}'
             mime_counts[mime_type] += 1
         else:
             missing.append(str(image_dir / (id_val + '.<ext>')))
@@ -190,14 +226,18 @@ def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Pat
 
     new_data = linesep + linesep.join(new_data_lines) + linesep
 
+    source = 'embedded' if embed else f'relPath:{rel_path}'
     if sections['column_props'] is None:
-        new_col_props = build_column_props_block(image_column, rel_path, mime_type)
+        new_col_props = build_column_props_block(image_column, source, mime_type)
     else:
-        new_col_props = update_column_props(sections['column_props'], image_column, rel_path, mime_type)
+        new_col_props = update_column_props(sections['column_props'], image_column, source, mime_type)
 
     parts = [sections['fileinfo'], linesep, new_col_props, new_data]
     if sections['hitlist']:
         parts.append(sections['hitlist'])
+        parts.append(linesep)
+    if embed and embedded_images:
+        parts.append(build_detail_section(embedded_images, linesep))
         parts.append(linesep)
     if sections['properties']:
         parts.append(sections['properties'])
@@ -212,12 +252,12 @@ def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Pat
     with open(dwar_file, 'w', encoding='utf-8', newline='') as f:
         f.write(new_content)
 
-    rows_updated = len(mime_counts.elements()) if False else sum(mime_counts.values())
+    rows_updated = sum(mime_counts.values())
     print(f"Updated: {dwar_file}")
     print(f"  id-column:    {id_column} (index {id_idx})")
     print(f"  image-column: {image_column} (index {img_idx})")
     print(f"  image-dir:    {image_dir.resolve()}")
-    print(f"  relPath:      '{rel_path}'")
+    print(f"  source:       {'embedded' if embed else repr(rel_path)}")
     print(f"  rows updated: {rows_updated}/{len(new_data_lines)-1}")
 
 
@@ -227,6 +267,7 @@ def main(
     id_column: str = typer.Argument(..., help="Column whose values map to image filenames (e.g. Name)"),
     image_column: str = typer.Argument(..., help="Column to attach images to (can be same as id-column)"),
     image_dir: Optional[Path] = typer.Argument(None, help="Directory containing images (default: 'images/' next to .dwar file)"),
+    embed: bool = typer.Option(False, '--embed', help="Embed images into the .dwar file instead of referencing them by path."),
 ):
     """
     Attach images to a DataWarrior .dwar file.
@@ -234,7 +275,7 @@ def main(
     Images are matched by searching for <id-value>.png/.jpg/.jpeg (case-insensitive)
     in the image directory. The original file is backed up with a .bak extension.
     """
-    add_images(dwar_file, id_column, image_column, image_dir)
+    add_images(dwar_file, id_column, image_column, image_dir, embed=embed)
 
 
 if __name__ == '__main__':
