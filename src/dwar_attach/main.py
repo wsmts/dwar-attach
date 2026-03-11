@@ -43,10 +43,52 @@ def encode_dw(data: bytes) -> str:
     return '\n'.join(s[i:i+80] for i in range(0, len(s), 80))
 
 
-def build_detail_section(details: list, linesep: str) -> str:
-    """Build the <detail data> block from a list of raw image bytes."""
+def _column_block(column_props: str, image_column: str) -> str | None:
+    """Return the text of the column block for image_column, or None if not found."""
+    m = re.search(
+        rf'<columnName="{re.escape(image_column)}">.*?(?=<columnName=|</column properties>)',
+        column_props, re.DOTALL
+    )
+    return m.group() if m else None
+
+
+def _slot_props(slot: int, source: str, mime_type: str, image_column: str) -> str:
+    """Return the three detailSource/Type/Name property lines for a slot."""
+    return (
+        f'<columnProperty="detailSource{slot}\t{source}">\n'
+        f'<columnProperty="detailType{slot}\t{mime_type}">\n'
+        f'<columnProperty="detailName{slot}\t{image_column}">\n'
+    )
+
+
+def get_detail_count(column_props: str, image_column: str) -> int:
+    """Return the current detailCount for image_column, or 0 if not found."""
+    block = _column_block(column_props, image_column)
+    if not block:
+        return 0
+    m = re.search(r'<columnProperty="detailCount\t(\d+)">', block)
+    return int(m.group(1)) if m else 0
+
+
+def count_existing_details(detail_data: str | None) -> int:
+    """Count <detailID=...> entries already present in the detail data block."""
+    if not detail_data:
+        return 0
+    return len(re.findall(r'<detailID="\d+">', detail_data))
+
+
+def build_detail_section(details: list, linesep: str, existing: str | None = None) -> str:
+    """Build the <detail data> block from a list of raw image bytes.
+
+    If existing is provided, new entries are appended after the existing ones.
+    """
     lines = ['<detail data>']
-    for i, data in enumerate(details, start=1):
+    start_id = 1
+    if existing:
+        inner = re.sub(r'^<detail data>\s*|\s*</detail data>$', '', existing)
+        start_id = len(re.findall(r'<detailID="\d+">', inner)) + 1
+        lines.append(inner)
+    for i, data in enumerate(details, start=start_id):
         lines.append(f'<detailID="{i}">')
         lines.append(encode_dw(data))
         lines.append(f'</detailID>')
@@ -103,35 +145,40 @@ def detect_line_ending(content):
     return '\r\n' if '\r\n' in content else '\n'
 
 
-def build_column_props_block(image_column, source, mime_type):
+def build_column_props_block(image_column, source, mime_type, slot: int = 0):
     lines = [
         '<column properties>',
         f'<columnName="{image_column}">',
-        '<columnProperty="detailCount\t1">',
-        f'<columnProperty="detailSource0\t{source}">',
-        f'<columnProperty="detailType0\t{mime_type}">',
-        f'<columnProperty="detailName0\t{image_column}">',
-        '</column properties>',
+        f'<columnProperty="detailCount\t{slot + 1}">',
     ]
+    lines.append(_slot_props(slot, source, mime_type, image_column).rstrip('\n'))
+    lines.append('</column properties>')
     return '\n'.join(lines)
 
 
-def update_column_props(existing, image_column, source, mime_type):
+def update_column_props(existing, image_column, source, mime_type, slot: int = 0):
     """Update or insert column properties for image_column in an existing block."""
-    new_props = (
-        f'<columnName="{image_column}">\n'
-        f'<columnProperty="detailCount\t1">\n'
-        f'<columnProperty="detailSource0\t{source}">\n'
-        f'<columnProperty="detailType0\t{mime_type}">\n'
-        f'<columnProperty="detailName0\t{image_column}">\n'
-    )
     if f'<columnName="{image_column}">' in existing:
-        pattern = (
-            rf'<columnName="{re.escape(image_column)}">.*?'
-            rf'(?=<columnName=|</column properties>)'
+        # Increment existing detailCount by 1
+        updated = re.sub(
+            rf'(<columnProperty="detailCount\t)(\d+)(">)',
+            lambda m: f'{m.group(1)}{int(m.group(2)) + 1}{m.group(3)}',
+            existing,
         )
-        return re.sub(pattern, new_props, existing, flags=re.DOTALL)
+        # Append new slot properties at the end of the column's block
+        col_block_pattern = rf'(<columnName="{re.escape(image_column)}">.*?)(?=<columnName=|</column properties>)'
+        return re.sub(
+            col_block_pattern,
+            lambda m: m.group(1) + _slot_props(slot, source, mime_type, image_column),
+            updated,
+            flags=re.DOTALL,
+        )
     else:
+        new_props = (
+            f'<columnName="{image_column}">\n'
+            f'<columnProperty="detailCount\t{slot + 1}">\n'
+            + _slot_props(slot, source, mime_type, image_column)
+        )
         return existing.replace('</column properties>', new_props + '</column properties>')
 
 
@@ -181,29 +228,39 @@ def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Pat
 
     rel_path = compute_rel_path(dwar_file, image_dir)
 
+    # Determine slot index and starting detail ID for this run
+    slot = get_detail_count(sections['column_props'], image_column) if sections['column_props'] else 0
+    next_id = count_existing_details(sections['detail_data']) + 1
+
     # Process rows
     missing = []
     mime_counts = Counter()
     new_data_lines = [data_lines[0]]
-    embedded_images = []  # list of (row_index, bytes) for embed mode
+    embedded_images = []  # list of bytes for embed mode
 
     for line in data_lines[1:]:
         cols = line.split('\t')
         while len(cols) <= max(id_idx, img_idx):
             cols.append('')
 
-        id_val = cols[id_idx]
+        id_val = cols[id_idx].split('|#|')[0]
         filename, mime_type = find_image(image_dir, id_val)
 
         if filename:
-            display = cols[img_idx].split('|#|')[0] if '|#|' in cols[img_idx] else cols[img_idx]
+            cell = cols[img_idx]
+            display = cell.split('|#|')[0] if '|#|' in cell else cell
+            # Preserve existing refs for other slots; replace/remove ref for current slot
+            existing_refs = re.findall(r'\|#\|(\d+:[^|]+)', cell)
+            kept_refs = [r for r in existing_refs if not r.startswith(f'{slot}:')]
             if embed:
-                detail_id = len(embedded_images) + 1
+                detail_id = next_id + len(embedded_images)
                 image_bytes = (image_dir / filename).read_bytes()
                 embedded_images.append(image_bytes)
-                cols[img_idx] = display + f'|#|0:{detail_id}'
+                new_ref = f'{slot}:{detail_id}'
             else:
-                cols[img_idx] = display + f'|#|0:{filename}'
+                new_ref = f'{slot}:{filename}'
+            all_refs = kept_refs + [new_ref]
+            cols[img_idx] = display + ''.join(f'|#|{r}' for r in all_refs)
             mime_counts[mime_type] += 1
         else:
             missing.append(str(image_dir / (id_val + '.<ext>')))
@@ -228,16 +285,19 @@ def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Pat
 
     source = 'embedded' if embed else f'relPath:{rel_path}'
     if sections['column_props'] is None:
-        new_col_props = build_column_props_block(image_column, source, mime_type)
+        new_col_props = build_column_props_block(image_column, source, mime_type, slot=slot)
     else:
-        new_col_props = update_column_props(sections['column_props'], image_column, source, mime_type)
+        new_col_props = update_column_props(sections['column_props'], image_column, source, mime_type, slot=slot)
 
     parts = [sections['fileinfo'], linesep, new_col_props, new_data]
     if sections['hitlist']:
         parts.append(sections['hitlist'])
         parts.append(linesep)
     if embed and embedded_images:
-        parts.append(build_detail_section(embedded_images, linesep))
+        parts.append(build_detail_section(embedded_images, linesep, existing=sections['detail_data']))
+        parts.append(linesep)
+    elif sections['detail_data']:
+        parts.append(sections['detail_data'])
         parts.append(linesep)
     if sections['properties']:
         parts.append(sections['properties'])
@@ -258,6 +318,7 @@ def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Pat
     print(f"  image-column: {image_column} (index {img_idx})")
     print(f"  image-dir:    {image_dir.resolve()}")
     print(f"  source:       {'embedded' if embed else repr(rel_path)}")
+    print(f"  slot:         {slot}")
     print(f"  rows updated: {rows_updated}/{len(new_data_lines)-1}")
 
 
