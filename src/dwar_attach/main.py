@@ -308,7 +308,7 @@ def add_images(dwar_file: Path, id_column, image_column, image_dir: Optional[Pat
     new_content = ''.join(parts)
 
     backup = dwar_file.with_name(dwar_file.name + '.bak')
-    shutil.copy(dwar_file, backup)
+    shutil.copyfile(dwar_file, backup)
     print(f"Backup: {backup}")
 
     with open(dwar_file, 'w', encoding='utf-8', newline='') as f:
